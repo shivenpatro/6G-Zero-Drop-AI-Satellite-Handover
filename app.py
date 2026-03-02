@@ -53,7 +53,7 @@ EAP_MS, DHCP_MS, BGP_MS = 1200.0, 800.0, 1500.0
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-# ── cached model loading ─────────────────────────────────────────────────────
+# ── cached model / scaler / fuzzy ────────────────────────────────────────────
 @st.cache_resource
 def load_lstm():
     model = SatelliteLSTM().to(DEVICE)
@@ -67,7 +67,7 @@ def load_scaler():
     return joblib.load("rsrp_scaler.joblib")
 
 @st.cache_resource
-def build_fuzzy():
+def build_fuzzy_cs():
     pred = ctrl.Antecedent(np.arange(-130, -89, 0.5), "predicted_rsrp")
     trend = ctrl.Antecedent(np.arange(-5, 5.1, 0.1), "rsrp_trend")
     urg = ctrl.Consequent(np.arange(0, 101, 1), "handover_urgency")
@@ -92,6 +92,34 @@ def build_fuzzy():
     return ctrl.ControlSystem(rules)
 
 
+# ── batch LSTM prediction (replaces per-step inference) ──────────────────────
+def _batch_predict(rsrp_arr, scaler, model):
+    """Pre-compute LSTM predictions for every valid step in one batched pass."""
+    n = len(rsrp_arr)
+    preds = np.full(n, np.nan)
+    if n < SEQ_LEN:
+        return preds
+
+    scaled = scaler.transform(rsrp_arr.reshape(-1, 1)).flatten()
+    windows = np.lib.stride_tricks.sliding_window_view(scaled, SEQ_LEN)
+    n_win = len(windows)
+
+    raw = np.zeros(n_win)
+    BATCH = 2048
+    for s in range(0, n_win, BATCH):
+        e = min(s + BATCH, n_win)
+        t = torch.tensor(
+            np.ascontiguousarray(windows[s:e]),
+            dtype=torch.float32
+        ).unsqueeze(-1).to(DEVICE)
+        with torch.no_grad():
+            raw[s:e] = model(t).cpu().numpy()
+
+    inv = scaler.inverse_transform(raw.reshape(-1, 1)).flatten()
+    preds[SEQ_LEN - 1 : SEQ_LEN - 1 + n_win] = inv
+    return preds
+
+
 # ── protocol audit text ──────────────────────────────────────────────────────
 def build_audit_text(reactive_events, ai_events):
     lines = []
@@ -112,11 +140,11 @@ def build_audit_text(reactive_events, ai_events):
         lines.append(f"\n  -- Handover #{idx} --")
         lines.append(f"{ts(t)} CRITICAL: Sat-{ev['from']} lost (RSRP={ev['rsrp']:.1f} dBm)")
         lines.append(f"{ts(t)} PROCESS : [6G-AKA'] +{EAP_MS:.0f}ms")
-        t += EAP_MS/1000
+        t += EAP_MS / 1000
         lines.append(f"{ts(t)} PROCESS : [DHCPv6]  +{DHCP_MS:.0f}ms")
-        t += DHCP_MS/1000
+        t += DHCP_MS / 1000
         lines.append(f"{ts(t)} PROCESS : [BGP/ISL] +{BGP_MS:.0f}ms")
-        t += BGP_MS/1000
+        t += BGP_MS / 1000
         lines.append(f"{ts(t)} RESTORED: Sat-{ev['to']}. Blackout={REACTIVE_MS:.0f}ms")
 
     lines.append(f"\n  Reactive total: {len(reactive_events)} HO x {REACTIVE_MS:.0f}ms "
@@ -145,11 +173,13 @@ def build_audit_text(reactive_events, ai_events):
 def run_full_simulation(noise_sigma: float, urgency_thresh: float):
     model  = load_lstm()
     scaler = load_scaler()
-    cs     = build_fuzzy()
+    cs     = build_fuzzy_cs()
 
-    # ── Phase 1: generate telemetry (vectorised numpy) ────────────────────
+    n = N_STEPS
+
+    # ── telemetry (vectorised numpy) ──────────────────────────────────────
     rng = np.random.default_rng(42)
-    t_arr = np.arange(N_STEPS) * DT
+    t_arr = np.arange(n) * DT
     x_a = SAT_A_X0 - VEL * t_arr
     x_b = SAT_B_X0 - VEL * t_arr
     d_a = np.sqrt(x_a**2 + ALT**2)
@@ -159,9 +189,9 @@ def run_full_simulation(noise_sigma: float, urgency_thresh: float):
     ok_b = np.abs(x_b) < h_dist
 
     def _rsrp(d, ok):
-        fspl = 20*np.log10(d) + 20*np.log10(FREQ) + 92.45
-        n = rng.normal(0, noise_sigma, d.shape)
-        r = TX_PWR - fspl + n
+        fspl = 20 * np.log10(d) + 20 * np.log10(FREQ) + 92.45
+        noise = rng.normal(0, noise_sigma, d.shape)
+        r = TX_PWR - fspl + noise
         return np.where(ok, r, RSRP_FLOOR)
 
     rsrp_a = np.round(_rsrp(d_a, ok_a), 2)
@@ -170,71 +200,76 @@ def run_full_simulation(noise_sigma: float, urgency_thresh: float):
     dist_b = np.round(d_b, 4)
     times  = np.round(t_arr, 2)
 
-    # ── Phase 2: reactive router (numpy arrays, no iloc) ─────────────────
-    n = N_STEPS
+    # ── batch LSTM predictions for both satellites ────────────────────────
+    pred_a = _batch_predict(rsrp_a, scaler, model)
+    pred_b = _batch_predict(rsrp_b, scaler, model)
+
+    # ── pre-compute trends (vectorised) ───────────────────────────────────
+    # Matches original: (hist[-1] - hist[-TREND_WIN]) / (TREND_WIN * DT)
+    trend_a = np.zeros(n)
+    trend_b = np.zeros(n)
+    trend_a[TREND_WIN - 1:] = (rsrp_a[TREND_WIN - 1:] - rsrp_a[:n - TREND_WIN + 1]) / (TREND_WIN * DT)
+    trend_b[TREND_WIN - 1:] = (rsrp_b[TREND_WIN - 1:] - rsrp_b[:n - TREND_WIN + 1]) / (TREND_WIN * DT)
+
+    # ── reactive router (numpy, no iloc) ──────────────────────────────────
     bl_lat = np.zeros(n)
-    cur_r = 0  # 0=A, 1=B
-    ho_rem = 0; cd_rem = 0; bl_ho_cnt = 0; tgt_r = 1
+    cur_r = 0; ho_rem = 0; cd_rem = 0; bl_ho_cnt = 0; tgt_r = 1
     bl_events = []
+    SAT = ("A", "B")
 
     for i in range(n):
         if ho_rem > 0:
             bl_lat[i] = REACTIVE_MS; ho_rem -= 1
-            if ho_rem == 0: cur_r = tgt_r; cd_rem = COOLDOWN_STEPS
+            if ho_rem == 0:
+                cur_r = tgt_r; cd_rem = COOLDOWN_STEPS
             continue
-        if cd_rem > 0: cd_rem -= 1
+        if cd_rem > 0:
+            cd_rem -= 1
         if cur_r == 0:
             cr, cd, ar, alt_idx = rsrp_a[i], dist_a[i], rsrp_b[i], 1
         else:
             cr, cd, ar, alt_idx = rsrp_b[i], dist_b[i], rsrp_a[i], 0
         if cr < HO_THRESH and cd_rem == 0 and ar > RSRP_FLOOR:
-            f_name = "A" if cur_r == 0 else "B"
-            t_name = "A" if alt_idx == 0 else "B"
             tgt_r = alt_idx; ho_rem = PENALTY_STEPS; bl_ho_cnt += 1
             bl_lat[i] = REACTIVE_MS
-            bl_events.append({"time": times[i], "from": f_name, "to": t_name, "rsrp": float(cr)})
+            bl_events.append({"time": float(times[i]), "from": SAT[cur_r],
+                              "to": SAT[alt_idx], "rsrp": float(cr)})
             continue
         bl_lat[i] = (cd / C_KMS) * 2 * 1000 + PROC_MS
 
-    # ── Phase 5: neuro-fuzzy router (optimised) ──────────────────────────
+    # ── neuro-fuzzy router (lookup pre-computed predictions) ──────────────
     fsim = ctrl.ControlSystemSimulation(cs)
     ai_lat = np.zeros(n)
     urg_log = np.zeros(n)
-    cur_ai = 0  # 0=A, 1=B
-    hist: list[float] = []
+    cur_ai = 0; warmup = 0
     ai_events = []
 
+    preds_arr = (pred_a, pred_b)
+    trends_arr = (trend_a, trend_b)
+    rsrps_arr = (rsrp_a, rsrp_b)
+    dists_arr = (dist_a, dist_b)
+
     for i in range(n):
-        if cur_ai == 0:
-            cr, cd, ar = rsrp_a[i], dist_a[i], rsrp_b[i]
-            alt_idx = 1
-        else:
-            cr, cd, ar = rsrp_b[i], dist_b[i], rsrp_a[i]
-            alt_idx = 0
-        hist.append(float(cr))
-        if len(hist) < SEQ_LEN:
+        cr  = rsrps_arr[cur_ai][i]
+        cd  = dists_arr[cur_ai][i]
+        alt_idx = 1 - cur_ai
+        ar  = rsrps_arr[alt_idx][i]
+
+        warmup += 1
+
+        if warmup < SEQ_LEN:
             ai_lat[i] = (cd / C_KMS) * 2 * 1000 + PROC_MS
             continue
 
-        w = np.array(hist[-SEQ_LEN:])
-        sc = scaler.transform(w.reshape(-1, 1)).flatten()
-        t = torch.tensor(sc, dtype=torch.float32).unsqueeze(0).unsqueeze(-1).to(DEVICE)
-        with torch.no_grad():
-            ps = model(t).item()
-        pred_dbm = float(scaler.inverse_transform([[ps]])[0, 0])
-
-        # fast-path: if prediction is clearly safe, skip fuzzy entirely
-        if pred_dbm > -100.0:
+        pred_dbm = preds_arr[cur_ai][i]
+        if np.isnan(pred_dbm) or pred_dbm > -100.0:
             ai_lat[i] = (cd / C_KMS) * 2 * 1000 + PROC_MS
             continue
 
-        if len(hist) >= TREND_WIN:
-            tv = (hist[-1] - hist[-TREND_WIN]) / (TREND_WIN * 0.1)
-        else:
-            tv = 0.0
+        tv = trends_arr[cur_ai][i]
 
-        fsim.input["predicted_rsrp"] = np.clip(pred_dbm, -130, -90)
-        fsim.input["rsrp_trend"]     = np.clip(tv, -5, 5)
+        fsim.input["predicted_rsrp"] = float(np.clip(pred_dbm, -130, -90))
+        fsim.input["rsrp_trend"]     = float(np.clip(tv, -5, 5))
         try:
             fsim.compute()
             u = float(fsim.output["handover_urgency"])
@@ -243,17 +278,17 @@ def run_full_simulation(noise_sigma: float, urgency_thresh: float):
         urg_log[i] = u
 
         if u >= urgency_thresh and ar > HO_THRESH:
-            f_name = "A" if cur_ai == 0 else "B"
-            t_name = "A" if alt_idx == 0 else "B"
             ai_lat[i] = SOFT_MS
-            ai_events.append({"time": float(times[i]), "from": f_name, "to": t_name,
-                              "urgency": u, "rsrp": float(cr), "pred": pred_dbm})
-            cur_ai = alt_idx; hist.clear()
+            ai_events.append({
+                "time": float(times[i]), "from": SAT[cur_ai],
+                "to": SAT[alt_idx], "urgency": u,
+                "rsrp": float(cr), "pred": float(pred_dbm)})
+            cur_ai = alt_idx
+            warmup = 0
             continue
 
         ai_lat[i] = (cd / C_KMS) * 2 * 1000 + PROC_MS
 
-    # Build DataFrame for charts
     df = pd.DataFrame({
         "time": times,
         "satA_distance": dist_a, "satA_rsrp": rsrp_a,
@@ -309,12 +344,9 @@ with st.spinner("Generating orbital telemetry & running both routers..."):
         run_full_simulation(float(noise_sigma), float(urgency_thresh))
 
 # ── KPI row ──────────────────────────────────────────────────────────────────
-bl_blackout_ms = (bl_lat >= REACTIVE_MS).sum() * DT * 1000
+bl_blackout_ms = float((bl_lat >= REACTIVE_MS).sum()) * DT * 1000
 ai_blackout_ms = len(ai_events) * SOFT_MS
-if bl_blackout_ms > 0:
-    efficiency = (1 - ai_blackout_ms / bl_blackout_ms) * 100
-else:
-    efficiency = 100.0
+efficiency = (1 - ai_blackout_ms / bl_blackout_ms) * 100 if bl_blackout_ms > 0 else 100.0
 
 k1, k2, k3, k4 = st.columns(4)
 k1.metric("Reactive Handovers", f"{bl_ho_cnt}")
@@ -324,7 +356,7 @@ k4.metric("Efficiency Gain", f"{efficiency:.1f} %")
 
 st.markdown("---")
 
-# ── Chart 1: Latency Comparison (Plotly) ─────────────────────────────────────
+# ── Chart 1: Latency Comparison ──────────────────────────────────────────────
 t_arr = df["time"].values
 
 fig1 = go.Figure()
