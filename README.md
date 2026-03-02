@@ -4,6 +4,9 @@
   <img src="https://img.shields.io/badge/Fuzzy_Logic-scikit--fuzzy-4CAF50?style=for-the-badge" />
   <img src="https://img.shields.io/badge/Streamlit-Dashboard-FF4B4B?style=for-the-badge&logo=streamlit&logoColor=white" />
   <img src="https://img.shields.io/badge/6G--NTN-Satellite-0D47A1?style=for-the-badge" />
+  <a href="https://github.com/shivenpatro/6G-Zero-Drop-AI-Satellite-Handover/releases/tag/v1.0.0">
+    <img src="https://img.shields.io/badge/Research_Paper-PDF-red?style=for-the-badge&logo=adobeacrobatreader&logoColor=white" />
+  </a>
 </p>
 
 <h1 align="center">6G Zero-Drop: Neuro-Fuzzy Predictive Satellite Handover</h1>
@@ -18,7 +21,8 @@
   <a href="#-the-problem"><b>Problem</b></a> ·
   <a href="#-architecture"><b>Architecture</b></a> ·
   <a href="#-results"><b>Results</b></a> ·
-  <a href="#-quickstart"><b>Quickstart</b></a>
+  <a href="#-quickstart"><b>Quickstart</b></a> ·
+  <a href="https://github.com/shivenpatro/6G-Zero-Drop-AI-Satellite-Handover/releases/tag/v1.0.0"><b>Research Paper</b></a>
 </p>
 
 ---
@@ -131,6 +135,24 @@ Why the latency differs: the reactive router executes EAP-AKA', DHCPv6, and BGP 
 
 ---
 
+## 📄 Research Paper
+
+This project is accompanied by a full IEEE conference-format research paper.
+
+<p align="center">
+  <a href="https://github.com/shivenpatro/6G-Zero-Drop-AI-Satellite-Handover/releases/tag/v1.0.0">
+    <img src="https://img.shields.io/badge/Download_Paper-PDF-red?style=for-the-badge&logo=adobeacrobatreader&logoColor=white" />
+  </a>
+</p>
+
+> **6G Zero-Drop: Neuro-Fuzzy Predictive Routing for Seamless LEO-Edge Handovers**
+>
+> Covers: orbital signal model (FSPL), LSTM gating equations, fuzzy membership functions and 7-rule base, protocol-layer timing analysis, and full comparative results.
+
+**Available in [Releases → v1.0.0](https://github.com/shivenpatro/6G-Zero-Drop-AI-Satellite-Handover/releases/tag/v1.0.0) as `6G_Zero_Drop_Research_Paper.pdf`.**
+
+---
+
 ## ⚡ Quickstart
 
 ### Prerequisites
@@ -219,6 +241,8 @@ This simulation serves as a **Proof of Concept** for an aerospace engineering re
 ## 📄 License
 
 This project is open-sourced for academic and research purposes.
+
+The research paper PDF is available via [GitHub Releases](https://github.com/shivenpatro/6G-Zero-Drop-AI-Satellite-Handover/releases/tag/v1.0.0).
 
 ---
 
