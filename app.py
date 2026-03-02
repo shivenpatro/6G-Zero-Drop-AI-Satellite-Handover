@@ -66,58 +66,7 @@ def load_lstm():
 def load_scaler():
     return joblib.load("rsrp_scaler.joblib")
 
-
-# ── telemetry generator (Phase 1 inlined) ────────────────────────────────────
-def generate_telemetry(noise_sigma: float) -> pd.DataFrame:
-    rng = np.random.default_rng(42)
-    t = np.arange(N_STEPS) * DT
-    x_a = SAT_A_X0 - VEL * t
-    x_b = SAT_B_X0 - VEL * t
-    d_a = np.sqrt(x_a**2 + ALT**2)
-    d_b = np.sqrt(x_b**2 + ALT**2)
-    h_dist = np.sqrt((EARTH_R + ALT)**2 - EARTH_R**2)
-    ok_a = np.abs(x_a) < h_dist
-    ok_b = np.abs(x_b) < h_dist
-
-    def rsrp(d, ok):
-        fspl = 20*np.log10(d) + 20*np.log10(FREQ) + 92.45
-        n = rng.normal(0, noise_sigma, d.shape)
-        r = TX_PWR - fspl + n
-        return np.where(ok, r, RSRP_FLOOR)
-
-    return pd.DataFrame({
-        "time": np.round(t, 2),
-        "satA_distance": np.round(d_a, 4), "satA_rsrp": np.round(rsrp(d_a, ok_a), 2),
-        "satB_distance": np.round(d_b, 4), "satB_rsrp": np.round(rsrp(d_b, ok_b), 2),
-    })
-
-
-# ── reactive router (Phase 2 inlined) ────────────────────────────────────────
-def run_reactive(df: pd.DataFrame):
-    n = len(df)
-    lat = np.zeros(n)
-    cur = "A"; ho_rem = 0; cd_rem = 0; ho_cnt = 0; tgt = "B"
-    ho_events = []
-    for i in range(n):
-        r = df.iloc[i]
-        if ho_rem > 0:
-            lat[i] = REACTIVE_MS; ho_rem -= 1
-            if ho_rem == 0: cur = tgt; cd_rem = COOLDOWN_STEPS
-            continue
-        if cd_rem > 0: cd_rem -= 1
-        if cur == "A":
-            rsrp, dist, alt_rsrp, alt = r.satA_rsrp, r.satA_distance, r.satB_rsrp, "B"
-        else:
-            rsrp, dist, alt_rsrp, alt = r.satB_rsrp, r.satB_distance, r.satA_rsrp, "A"
-        if rsrp < HO_THRESH and cd_rem == 0 and alt_rsrp > RSRP_FLOOR:
-            tgt = alt; ho_rem = PENALTY_STEPS; ho_cnt += 1; lat[i] = REACTIVE_MS
-            ho_events.append({"time": r.time, "from": cur, "to": alt, "rsrp": rsrp})
-            continue
-        lat[i] = (dist / C_KMS) * 2 * 1000 + PROC_MS
-    return lat, ho_cnt, ho_events
-
-
-# ── fuzzy system builder ─────────────────────────────────────────────────────
+@st.cache_resource
 def build_fuzzy():
     pred = ctrl.Antecedent(np.arange(-130, -89, 0.5), "predicted_rsrp")
     trend = ctrl.Antecedent(np.arange(-5, 5.1, 0.1), "rsrp_trend")
@@ -140,57 +89,7 @@ def build_fuzzy():
         ctrl.Rule(pred["marginal"] & trend["improving"],    urg["low"]),
         ctrl.Rule(pred["good"],                             urg["low"]),
     ]
-    return ctrl.ControlSystemSimulation(ctrl.ControlSystem(rules))
-
-
-# ── neuro-fuzzy router (Phase 5 inlined) ─────────────────────────────────────
-def run_neurofuzzy(df: pd.DataFrame, model, scaler, urgency_thresh: float):
-    fsim = build_fuzzy()
-    n = len(df)
-    lat = np.zeros(n)
-    urg_log = np.zeros(n)
-    cur = "A"; hist: list[float] = []
-    ho_events = []
-
-    for i in range(n):
-        r = df.iloc[i]
-        if cur == "A":
-            cr, cd, ar, alt = r.satA_rsrp, r.satA_distance, r.satB_rsrp, "B"
-        else:
-            cr, cd, ar, alt = r.satB_rsrp, r.satB_distance, r.satA_rsrp, "A"
-        hist.append(cr)
-        if len(hist) < SEQ_LEN:
-            lat[i] = (cd / C_KMS) * 2 * 1000 + PROC_MS; continue
-
-        w = np.array(hist[-SEQ_LEN:])
-        sc = scaler.transform(w.reshape(-1, 1)).flatten()
-        t = torch.tensor(sc, dtype=torch.float32).unsqueeze(0).unsqueeze(-1).to(DEVICE)
-        with torch.no_grad():
-            ps = model(t).item()
-        pred_dbm = scaler.inverse_transform([[ps]])[0, 0]
-
-        if len(hist) >= TREND_WIN:
-            tv = (hist[-1] - hist[-TREND_WIN]) / (TREND_WIN * 0.1)
-        else:
-            tv = 0.0
-
-        fsim.input["predicted_rsrp"] = np.clip(pred_dbm, -130, -90)
-        fsim.input["rsrp_trend"]     = np.clip(tv, -5, 5)
-        try:
-            fsim.compute(); u = float(fsim.output["handover_urgency"])
-        except Exception:
-            u = 0.0
-        urg_log[i] = u
-
-        if u >= urgency_thresh and ar > HO_THRESH:
-            lat[i] = SOFT_MS
-            ho_events.append({"time": r.time, "from": cur, "to": alt,
-                              "urgency": u, "rsrp": cr, "pred": pred_dbm})
-            cur = alt; hist.clear(); continue
-
-        lat[i] = (cd / C_KMS) * 2 * 1000 + PROC_MS
-
-    return lat, urg_log, ho_events
+    return ctrl.ControlSystem(rules)
 
 
 # ── protocol audit text ──────────────────────────────────────────────────────
@@ -241,11 +140,134 @@ def build_audit_text(reactive_events, ai_events):
     return "\n".join(lines)
 
 
+# ── full simulation (cached by slider values) ────────────────────────────────
+@st.cache_data(show_spinner=False)
+def run_full_simulation(noise_sigma: float, urgency_thresh: float):
+    model  = load_lstm()
+    scaler = load_scaler()
+    cs     = build_fuzzy()
+
+    # ── Phase 1: generate telemetry (vectorised numpy) ────────────────────
+    rng = np.random.default_rng(42)
+    t_arr = np.arange(N_STEPS) * DT
+    x_a = SAT_A_X0 - VEL * t_arr
+    x_b = SAT_B_X0 - VEL * t_arr
+    d_a = np.sqrt(x_a**2 + ALT**2)
+    d_b = np.sqrt(x_b**2 + ALT**2)
+    h_dist = np.sqrt((EARTH_R + ALT)**2 - EARTH_R**2)
+    ok_a = np.abs(x_a) < h_dist
+    ok_b = np.abs(x_b) < h_dist
+
+    def _rsrp(d, ok):
+        fspl = 20*np.log10(d) + 20*np.log10(FREQ) + 92.45
+        n = rng.normal(0, noise_sigma, d.shape)
+        r = TX_PWR - fspl + n
+        return np.where(ok, r, RSRP_FLOOR)
+
+    rsrp_a = np.round(_rsrp(d_a, ok_a), 2)
+    rsrp_b = np.round(_rsrp(d_b, ok_b), 2)
+    dist_a = np.round(d_a, 4)
+    dist_b = np.round(d_b, 4)
+    times  = np.round(t_arr, 2)
+
+    # ── Phase 2: reactive router (numpy arrays, no iloc) ─────────────────
+    n = N_STEPS
+    bl_lat = np.zeros(n)
+    cur_r = 0  # 0=A, 1=B
+    ho_rem = 0; cd_rem = 0; bl_ho_cnt = 0; tgt_r = 1
+    bl_events = []
+
+    for i in range(n):
+        if ho_rem > 0:
+            bl_lat[i] = REACTIVE_MS; ho_rem -= 1
+            if ho_rem == 0: cur_r = tgt_r; cd_rem = COOLDOWN_STEPS
+            continue
+        if cd_rem > 0: cd_rem -= 1
+        if cur_r == 0:
+            cr, cd, ar, alt_idx = rsrp_a[i], dist_a[i], rsrp_b[i], 1
+        else:
+            cr, cd, ar, alt_idx = rsrp_b[i], dist_b[i], rsrp_a[i], 0
+        if cr < HO_THRESH and cd_rem == 0 and ar > RSRP_FLOOR:
+            f_name = "A" if cur_r == 0 else "B"
+            t_name = "A" if alt_idx == 0 else "B"
+            tgt_r = alt_idx; ho_rem = PENALTY_STEPS; bl_ho_cnt += 1
+            bl_lat[i] = REACTIVE_MS
+            bl_events.append({"time": times[i], "from": f_name, "to": t_name, "rsrp": float(cr)})
+            continue
+        bl_lat[i] = (cd / C_KMS) * 2 * 1000 + PROC_MS
+
+    # ── Phase 5: neuro-fuzzy router (optimised) ──────────────────────────
+    fsim = ctrl.ControlSystemSimulation(cs)
+    ai_lat = np.zeros(n)
+    urg_log = np.zeros(n)
+    cur_ai = 0  # 0=A, 1=B
+    hist: list[float] = []
+    ai_events = []
+
+    for i in range(n):
+        if cur_ai == 0:
+            cr, cd, ar = rsrp_a[i], dist_a[i], rsrp_b[i]
+            alt_idx = 1
+        else:
+            cr, cd, ar = rsrp_b[i], dist_b[i], rsrp_a[i]
+            alt_idx = 0
+        hist.append(float(cr))
+        if len(hist) < SEQ_LEN:
+            ai_lat[i] = (cd / C_KMS) * 2 * 1000 + PROC_MS
+            continue
+
+        w = np.array(hist[-SEQ_LEN:])
+        sc = scaler.transform(w.reshape(-1, 1)).flatten()
+        t = torch.tensor(sc, dtype=torch.float32).unsqueeze(0).unsqueeze(-1).to(DEVICE)
+        with torch.no_grad():
+            ps = model(t).item()
+        pred_dbm = float(scaler.inverse_transform([[ps]])[0, 0])
+
+        # fast-path: if prediction is clearly safe, skip fuzzy entirely
+        if pred_dbm > -100.0:
+            ai_lat[i] = (cd / C_KMS) * 2 * 1000 + PROC_MS
+            continue
+
+        if len(hist) >= TREND_WIN:
+            tv = (hist[-1] - hist[-TREND_WIN]) / (TREND_WIN * 0.1)
+        else:
+            tv = 0.0
+
+        fsim.input["predicted_rsrp"] = np.clip(pred_dbm, -130, -90)
+        fsim.input["rsrp_trend"]     = np.clip(tv, -5, 5)
+        try:
+            fsim.compute()
+            u = float(fsim.output["handover_urgency"])
+        except Exception:
+            u = 0.0
+        urg_log[i] = u
+
+        if u >= urgency_thresh and ar > HO_THRESH:
+            f_name = "A" if cur_ai == 0 else "B"
+            t_name = "A" if alt_idx == 0 else "B"
+            ai_lat[i] = SOFT_MS
+            ai_events.append({"time": float(times[i]), "from": f_name, "to": t_name,
+                              "urgency": u, "rsrp": float(cr), "pred": pred_dbm})
+            cur_ai = alt_idx; hist.clear()
+            continue
+
+        ai_lat[i] = (cd / C_KMS) * 2 * 1000 + PROC_MS
+
+    # Build DataFrame for charts
+    df = pd.DataFrame({
+        "time": times,
+        "satA_distance": dist_a, "satA_rsrp": rsrp_a,
+        "satB_distance": dist_b, "satB_rsrp": rsrp_b,
+    })
+
+    return df, bl_lat, bl_ho_cnt, bl_events, ai_lat, urg_log, ai_events
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  STREAMLIT APP
 # ═══════════════════════════════════════════════════════════════════════════════
 st.set_page_config(page_title="6G Zero-Drop AI", layout="wide",
-                   page_icon="🛰️")
+                   page_icon="\U0001f6f0\ufe0f")
 
 st.markdown("""
 <h1 style='text-align:center; margin-bottom:0;'>
@@ -282,13 +304,9 @@ with st.sidebar:
         "5. Protocol simulator logs 6G-AKA', DHCPv6, BGP layers.")
 
 # ── run simulation ───────────────────────────────────────────────────────────
-model  = load_lstm()
-scaler = load_scaler()
-
 with st.spinner("Generating orbital telemetry & running both routers..."):
-    df = generate_telemetry(noise_sigma)
-    bl_lat, bl_ho_cnt, bl_events = run_reactive(df)
-    ai_lat, urg_arr, ai_events   = run_neurofuzzy(df, model, scaler, float(urgency_thresh))
+    df, bl_lat, bl_ho_cnt, bl_events, ai_lat, urg_arr, ai_events = \
+        run_full_simulation(float(noise_sigma), float(urgency_thresh))
 
 # ── KPI row ──────────────────────────────────────────────────────────────────
 bl_blackout_ms = (bl_lat >= REACTIVE_MS).sum() * DT * 1000
