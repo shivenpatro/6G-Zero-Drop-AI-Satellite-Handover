@@ -25,8 +25,16 @@
 
 ## 🚀 Live Demo
 
-> **[Launch the Interactive Dashboard]()**
-> _(Streamlit Community Cloud — link to be updated after deployment)_
+> **[Launch the Interactive Dashboard](https://6g-zero-drop-ai-satellite-handover-ia3kgnbtus29htksdpnnrp.streamlit.app/)**
+> _(Deployed on Streamlit Community Cloud — try it live!)_
+
+<p align="center">
+  <a href="https://6g-zero-drop-ai-satellite-handover-ia3kgnbtus29htksdpnnrp.streamlit.app/">
+    <img src="docs/app_screenshot.png" width="100%" alt="6G Zero-Drop Interactive Dashboard — Streamlit App"/>
+  </a>
+  <br/>
+  <i>Interactive dashboard with tunable atmospheric noise and AI urgency threshold</i>
+</p>
 
 ---
 
@@ -175,6 +183,7 @@ Open **http://localhost:8501** and use the sidebar sliders to tune atmospheric n
 ├── rsrp_scaler.joblib        # MinMaxScaler for RSRP normalization
 ├── requirements.txt          # Python dependencies
 ├── docs/
+│   ├── app_screenshot.png
 │   ├── latency_comparison.png
 │   ├── neurofuzzy_dashboard.png
 │   ├── protocol_timeline.png
